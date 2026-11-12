@@ -1,0 +1,172 @@
+#!/usr/bin/env python3
+"""Create/update Gmail drafts through the official Gmail API, so links stay exactly as written.
+
+Why: the Claude Gmail connector rewrites links into dead google.com/url redirects.
+
+Setup (once):
+  1. Google Cloud console -> enable "Gmail API" -> Credentials -> OAuth client ID -> Desktop app.
+  2. Save the downloaded JSON as ~/.config/gmail-draft/client.json
+  3. gmail-draft auth          (opens the browser once; token saved to ~/.config/gmail-draft/token.json)
+
+Use:
+  gmail-draft create --to a@x.com [--cc b@x.com] --subject "Hi" --body-file msg.txt [--html-file msg.html] [--reply-to-msg <gmail message id>]
+  gmail-draft update <draft id> --body-file msg.txt [--html-file msg.html] [--subject ...] [--to ...] [--cc ...]
+  gmail-draft get <draft id>    (prints the stored raw MIME, to verify links)
+Stdlib only.
+"""
+import argparse, base64, http.server, json, os, secrets, sys, time, urllib.parse, urllib.request, webbrowser
+from email.message import EmailMessage
+
+DIR = os.path.expanduser('~/.config/gmail-draft')
+CLIENT, TOKEN = os.path.join(DIR, 'client.json'), os.path.join(DIR, 'token.json')
+SCOPES = 'https://www.googleapis.com/auth/gmail.compose https://www.googleapis.com/auth/gmail.metadata'
+API = 'https://gmail.googleapis.com/gmail/v1/users/me'
+
+
+def _post_form(url, data):
+    req = urllib.request.Request(url, urllib.parse.urlencode(data).encode())
+    return json.load(urllib.request.urlopen(req))
+
+
+def _client():
+    c = json.load(open(CLIENT))
+    return c.get('installed') or c.get('web')
+
+
+def _save_token(tok):
+    os.makedirs(DIR, mode=0o700, exist_ok=True)
+    tok['expires_at'] = time.time() + tok.get('expires_in', 3600) - 60
+    old = json.load(open(TOKEN)) if os.path.exists(TOKEN) else {}
+    tok.setdefault('refresh_token', old.get('refresh_token'))
+    fd = os.open(TOKEN, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, 'w') as f:
+        json.dump(tok, f)
+
+
+def auth():
+    c = _client()
+    state, code = secrets.token_urlsafe(16), {}
+
+    class H(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            if q.get('state', [''])[0] == state:
+                code['v'] = q.get('code', [''])[0]
+            self.send_response(200); self.end_headers()
+            self.wfile.write(b'Done. You can close this tab.')
+
+        def log_message(self, *a):
+            pass
+
+    srv = http.server.HTTPServer(('127.0.0.1', 0), H)
+    redirect = f'http://127.0.0.1:{srv.server_port}'
+    url = 'https://accounts.google.com/o/oauth2/v2/auth?' + urllib.parse.urlencode({
+        'client_id': c['client_id'], 'redirect_uri': redirect, 'response_type': 'code',
+        'scope': SCOPES, 'access_type': 'offline', 'prompt': 'consent', 'state': state})
+    print('Opening browser for Google sign-in...\n' + url)
+    webbrowser.open(url)
+    while 'v' not in code:
+        srv.handle_request()
+    _save_token(_post_form('https://oauth2.googleapis.com/token', {
+        'code': code['v'], 'client_id': c['client_id'], 'client_secret': c['client_secret'],
+        'redirect_uri': redirect, 'grant_type': 'authorization_code'}))
+    print('Signed in. Token saved to', TOKEN)
+
+
+def _access_token():
+    tok = json.load(open(TOKEN))
+    if time.time() < tok.get('expires_at', 0):
+        return tok['access_token']
+    c = _client()
+    new = _post_form('https://oauth2.googleapis.com/token', {
+        'refresh_token': tok['refresh_token'], 'client_id': c['client_id'],
+        'client_secret': c['client_secret'], 'grant_type': 'refresh_token'})
+    _save_token(new)
+    return new['access_token']
+
+
+def _api(method, path, body=None):
+    req = urllib.request.Request(API + path, method=method,
+                                 data=json.dumps(body).encode() if body is not None else None,
+                                 headers={'Authorization': 'Bearer ' + _access_token(),
+                                          'Content-Type': 'application/json'})
+    try:
+        return json.load(urllib.request.urlopen(req))
+    except urllib.error.HTTPError as e:
+        sys.exit(f'Gmail API {e.code}: {e.read().decode()[:500]}')
+
+
+def build_mime(to, cc, subject, text, html=None, in_reply_to=None, references=None):
+    m = EmailMessage()
+    if to: m['To'] = ', '.join(to)
+    if cc: m['Cc'] = ', '.join(cc)
+    m['Subject'] = subject or ''
+    if in_reply_to:
+        m['In-Reply-To'] = in_reply_to
+        m['References'] = references or in_reply_to
+    m.set_content(text)
+    if html:
+        m.add_alternative(html, subtype='html')
+    return base64.urlsafe_b64encode(m.as_bytes()).decode()
+
+
+def _reply_headers(msg_id):
+    meta = _api('GET', f'/messages/{msg_id}?format=metadata&metadataHeaders=Message-ID'
+                       '&metadataHeaders=References&metadataHeaders=Subject')
+    h = {x['name'].lower(): x['value'] for x in meta['payload']['headers']}
+    mid = h.get('message-id')
+    refs = (h.get('references', '') + ' ' + (mid or '')).strip()
+    return meta['threadId'], mid, refs, h.get('subject', '')
+
+
+def _read(path):
+    return open(path, encoding='utf-8').read() if path else None
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = p.add_subparsers(dest='cmd', required=True)
+    sub.add_parser('auth')
+    for name in ('create', 'update'):
+        s = sub.add_parser(name)
+        if name == 'update':
+            s.add_argument('draft_id')
+        s.add_argument('--to', nargs='*', default=[])
+        s.add_argument('--cc', nargs='*', default=[])
+        s.add_argument('--subject')
+        s.add_argument('--body-file', required=True)
+        s.add_argument('--html-file')
+        s.add_argument('--reply-to-msg', help='Gmail message id to reply to (keeps the thread)')
+    g = sub.add_parser('get'); g.add_argument('draft_id')
+    a = p.parse_args()
+
+    if a.cmd == 'auth':
+        return auth()
+    if a.cmd == 'get':
+        d = _api('GET', f'/drafts/{a.draft_id}?format=raw')
+        return print(base64.urlsafe_b64decode(d['message']['raw']).decode('utf-8', 'replace'))
+
+    thread = irt = refs = None
+    subject = a.subject
+    if a.reply_to_msg:
+        thread, irt, refs, orig_subj = _reply_headers(a.reply_to_msg)
+        subject = subject or (orig_subj if orig_subj.lower().startswith('re:') else 'Re: ' + orig_subj)
+    raw = build_mime(a.to, a.cc, subject, _read(a.body_file), _read(a.html_file), irt, refs)
+    msg = {'raw': raw, **({'threadId': thread} if thread else {})}
+    if a.cmd == 'create':
+        d = _api('POST', '/drafts', {'message': msg})
+    else:
+        d = _api('PUT', f'/drafts/{a.draft_id}', {'id': a.draft_id, 'message': msg})
+    print(json.dumps({'draft_id': d['id'], 'message_id': d['message']['id'], 'thread_id': d['message'].get('threadId')}))
+
+
+def _selfcheck():
+    raw = build_mime(['a@x.com'], [], 'Hi', 'See https://example.com/x', '<a href="https://example.com/x">x</a>', '<m@id>')
+    out = base64.urlsafe_b64decode(raw).decode()
+    assert 'https://example.com/x' in out and 'google.com/url' not in out
+    assert 'In-Reply-To: <m@id>' in out and 'text/html' in out
+    print('selfcheck ok')
+
+
+if __name__ == '__main__':
+    _selfcheck() if sys.argv[1:] == ['--selfcheck'] else main()
